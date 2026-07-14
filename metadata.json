@@ -1,0 +1,6 @@
+{
+  "name": "Antigravity Vision Context Optimizer",
+  "description": "An interactive workbench that compiles long text context into optimized dense images to bypass token limits and cost, featuring real-time vision threshold calibration for Gemini models.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
