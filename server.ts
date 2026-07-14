@@ -7,6 +7,25 @@ import { renderWorkspaceToSvgDataUrl } from "./src/utils/svgRenderer";
 
 dotenv.config();
 
+// --- Configuration Types & Interfaces ---
+interface WorkspaceFile {
+  name: string;
+  content: string;
+  language?: string;
+}
+
+interface PendingJob {
+  files: WorkspaceFile[];
+  theme: "dark" | "light";
+  resolve: (dataUrl: string) => void;
+}
+
+interface McpActiveRender {
+  id: string;
+  files: WorkspaceFile[];
+  theme: "dark" | "light";
+}
+
 // --- MCP & Knowledge Graph State ---
 let serverSideObsidianNotes: any[] = [
   {
@@ -35,8 +54,8 @@ let serverSideObsidianNotes: any[] = [
   }
 ];
 
-const pendingRenders = new Map<string, { files: any[]; theme: string; resolve: (dataUrl: string) => void }>();
-const activeMcpRenders: any[] = [];
+const pendingRenders = new Map<string, PendingJob>();
+const activeMcpRenders: McpActiveRender[] = [];
 
 // --- Central MCP Request Handler (JSON-RPC 2.0) ---
 async function handleMcpRequest(request: any, sendResponse: (res: any) => void) {
@@ -81,7 +100,8 @@ async function handleMcpRequest(request: any, sendResponse: (res: any) => void) 
                       type: "object",
                       properties: {
                         name: { type: "string", description: "File path/name (e.g. server.ts)" },
-                        content: { type: "string", description: "Raw content of the file." }
+                        content: { type: "string", description: "Raw content of the file." },
+                        language: { type: "string", description: "Source language code (optional)." }
                       },
                       required: ["name", "content"]
                     },
@@ -134,7 +154,6 @@ async function handleMcpRequest(request: any, sendResponse: (res: any) => void) 
           { source: "node-ctx-comp", target: "node-ctx-stitch" }
         ];
 
-        // Combine static nodes and real obsidian notes
         const graphNodes = [
           ...staticNodes.map(n => ({ id: n.id, label: n.label, type: n.category })),
           ...serverSideObsidianNotes.map(n => ({ id: `note-${n.id}`, label: n.title, type: "obsidian-note", content: n.content }))
@@ -182,12 +201,12 @@ async function handleMcpRequest(request: any, sendResponse: (res: any) => void) 
           return;
         }
 
+        const normalizedTheme: "dark" | "light" = theme === "light" ? "light" : "dark";
         const renderId = Math.random().toString(36).substring(2, 11);
         
-        // Push job to active bridge
         pendingRenders.set(renderId, {
           files,
-          theme,
+          theme: normalizedTheme,
           resolve: (dataUrl: string) => {
             const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
             const mimeType = match ? match[1] : "image/png";
@@ -213,7 +232,7 @@ async function handleMcpRequest(request: any, sendResponse: (res: any) => void) 
           }
         });
 
-        activeMcpRenders.push({ id: renderId, files, theme });
+        activeMcpRenders.push({ id: renderId, files, theme: normalizedTheme });
 
         // Fallback: If no browser client resolves this within 400ms, compile server-side vector SVG instantly
         setTimeout(() => {
@@ -224,7 +243,7 @@ async function handleMcpRequest(request: any, sendResponse: (res: any) => void) 
             pendingRenders.delete(renderId);
 
             try {
-              const result = renderWorkspaceToSvgDataUrl(files, theme);
+              const result = renderWorkspaceToSvgDataUrl(job.files, job.theme);
               const match = result.dataUrl.match(/^data:([^;]+);base64,(.+)$/);
               const mimeType = match ? match[1] : "image/svg+xml";
               const base64Data = match ? match[2] : result.dataUrl;
@@ -236,7 +255,7 @@ async function handleMcpRequest(request: any, sendResponse: (res: any) => void) 
                   content: [
                     {
                       type: "text",
-                      text: `Successfully compressed context! (Server-side SVG Fallback) Stitched ${files.length} files. Visual blueprint rendered as highly-sharp vector SVG. Token cost reduced to flat 258 tokens.\nBase64 Data URI: ${result.dataUrl}`
+                      text: `Successfully compressed context! (Server-side SVG Fallback) Stitched ${job.files.length} files. Visual blueprint rendered as highly-sharp vector SVG. Token cost reduced to flat 258 tokens.\nBase64 Data URI: ${result.dataUrl}`
                     },
                     {
                       type: "image",
@@ -340,29 +359,21 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Increase payload limit for base64 context images
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
   // --- API Routes ---
-
-  // Health check
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
   });
 
-  // Check if Gemini API is configured
   app.get("/api/config-status", (req, res) => {
     const isConfigured = !!process.env.GEMINI_API_KEY;
     res.json({ configured: isConfigured });
   });
 
-  // --- Express MCP Server Endpoints ---
-  
-  // Real-time SSE Clients list
   const sseClients = new Set<{ sessionId: string; res: express.Response }>();
 
-  // Sync Obsidian notes from browser to server
   app.post("/api/mcp/sync-notes", (req, res) => {
     if (Array.isArray(req.body)) {
       serverSideObsidianNotes = req.body;
@@ -370,17 +381,14 @@ async function startServer() {
     res.json({ success: true, count: serverSideObsidianNotes.length });
   });
 
-  // Get current active Obsidian notes list
   app.get("/api/mcp/sync-notes", (req, res) => {
     res.json(serverSideObsidianNotes);
   });
 
-  // Client-Render Worker Bridge: Browser polls for high-DPI canvas render requests
   app.get("/api/mcp/pending-renders", (req, res) => {
     res.json(activeMcpRenders);
   });
 
-  // Client-Render Worker Bridge: Browser posts the finished base64 data-url
   app.post("/api/mcp/submit-render", (req, res) => {
     const { id, dataUrl } = req.body;
     if (!id || !dataUrl) {
@@ -401,7 +409,6 @@ async function startServer() {
     }
   });
 
-  // SSE Transport connection endpoint
   app.get("/api/mcp/sse", (req, res) => {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -410,8 +417,6 @@ async function startServer() {
     });
 
     const sessionId = Math.random().toString(36).substring(2, 15);
-    
-    // Write out standard MCP SSE transport handshake
     res.write(`event: endpoint\ndata: /api/mcp/messages?sessionId=${sessionId}\n\n`);
 
     const client = { sessionId, res };
@@ -422,7 +427,6 @@ async function startServer() {
     });
   });
 
-  // SSE Transport client message post endpoint
   app.post("/api/mcp/messages", (req, res) => {
     const sessionId = req.query.sessionId as string;
     const request = req.body;
@@ -433,7 +437,6 @@ async function startServer() {
       if (client) {
         client.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
       } else {
-        // Fallback: respond directly to HTTP request if no active SSE session matches
         res.json(response);
         return;
       }
@@ -443,7 +446,6 @@ async function startServer() {
     res.status(202).end();
   });
 
-  // Calibration Endpoint: test single step
   app.post("/api/calibrate-step", async (req, res) => {
     try {
       const { modelName, image, needle } = req.body;
@@ -453,7 +455,6 @@ async function startServer() {
         return;
       }
 
-      // Extract raw base64 data and mimeType
       const match = image.match(/^data:([^;]+);base64,(.+)$/);
       if (!match) {
         res.status(400).json({ error: "Invalid image format" });
@@ -484,8 +485,6 @@ async function startServer() {
       });
 
       const extractedText = response.text ? response.text.trim() : "";
-      
-      // Determine match
       const passed = extractedText.toUpperCase().includes(needle.toUpperCase()) || 
                      needle.toUpperCase().includes(extractedText.toUpperCase()) && extractedText.length >= 3;
 
@@ -499,7 +498,6 @@ async function startServer() {
     }
   });
 
-  // Chat with Image Context (Antigravity Mode)
   app.post("/api/chat-with-image-context", async (req, res) => {
     try {
       const { modelName, contextImage, prompt } = req.body;
@@ -545,7 +543,7 @@ Structure your response clearly and professionally.`,
 
       res.json({
         response: response.text || "No response generated.",
-        imageTokenCost: 258, // Standard flat cost for Gemini multimodal
+        imageTokenCost: 258,
       });
     } catch (error: any) {
       console.error("Error in /api/chat-with-image-context:", error);
@@ -553,7 +551,6 @@ Structure your response clearly and professionally.`,
     }
   });
 
-  // Chat with Text Context (Normal Mode for token & cost comparison)
   app.post("/api/chat-with-text-context", async (req, res) => {
     try {
       const { modelName, contextText, prompt } = req.body;
@@ -579,7 +576,6 @@ Based on the context above, answer this user query:
         ],
       });
 
-      // Rough token estimation: ~4 characters per token
       const inputTokens = Math.ceil(contextText.length / 4) + Math.ceil(prompt.length / 4);
       const outputTokens = Math.ceil((response.text || "").length / 4);
 
@@ -595,9 +591,6 @@ Based on the context above, answer this user query:
     }
   });
 
-  // --- OAuth & Multi-Agent Studio Integration ---
-
-  // Active OAuth connections stored in memory
   const oauthSessions: Record<string, { status: "connected" | "disconnected"; connectedEmail: string }> = {
     github: { status: "disconnected", connectedEmail: "" },
     google: { status: "disconnected", connectedEmail: "" },
@@ -605,12 +598,10 @@ Based on the context above, answer this user query:
     anthropic: { status: "disconnected", connectedEmail: "" },
   };
 
-  // Get active OAuth connection states
   app.get("/api/oauth/status", (req, res) => {
     res.json(oauthSessions);
   });
 
-  // Disconnect provider
   app.post("/api/oauth/disconnect", (req, res) => {
     const { provider } = req.body;
     if (provider && oauthSessions[provider]) {
@@ -619,7 +610,6 @@ Based on the context above, answer this user query:
     res.json({ success: true, status: oauthSessions });
   });
 
-  // Construct OAuth url redirects
   app.get("/api/auth/url", (req, res) => {
     const { provider } = req.query;
     if (!provider || typeof provider !== "string") {
@@ -629,13 +619,10 @@ Based on the context above, answer this user query:
 
     const appUrl = process.env.APP_URL || `http://localhost:${PORT}`;
     const redirectUri = `${appUrl}/auth/callback`;
-
-    // Direct redirection URL for popup handler to authorization panel
     const authUrl = `${appUrl}/auth-sim?provider=${provider}&redirect_uri=${encodeURIComponent(redirectUri)}`;
     res.json({ url: authUrl });
   });
 
-  // Auth callback route
   app.get(["/auth/callback", "/auth/callback/"], (req, res) => {
     const { provider, email } = req.query;
     
@@ -646,7 +633,6 @@ Based on the context above, answer this user query:
       };
     }
 
-    // Return popup window closing logic
     res.send(`
       <!doctype html>
       <html>
@@ -730,7 +716,6 @@ Based on the context above, answer this user query:
     `);
   });
 
-  // Multi-Model Council Discussion
   app.post("/api/agent-council-discuss", async (req, res) => {
     try {
       const { contextImage, prompt, activeAgents } = req.body;
@@ -750,9 +735,6 @@ Based on the context above, answer this user query:
 
       const ai = getGeminiClient();
 
-      // We will prompt Gemini (the native multi-modal client) to generate a structured multi-agent panel debate,
-      // simulating feedback from the active agents (e.g., Anthropic Claude, OpenAI GPT-4, Google Gemini) 
-      // based strictly on their real characteristics and what they read in the compiled Antigravity image context.
       const agentNamesAndTraits = {
         "agent-gemini": "Google Gemini 3.5 Pro: High-context visual expert, specializing in vision inputs, multimodal performance analysis, complex nested structures, and codebase token efficiency.",
         "agent-claude": "Anthropic Claude 3.5 Sonnet: Precise coder focusing on modular clean architecture, comprehensive type-safety, and deep algorithmic debugging.",
@@ -783,8 +765,7 @@ Please format your response strictly as a JSON object containing a "discussion" 
   ]
 }
 
-Ensure the agents interact with each other (e.g. Claude agreeing with Gemini's layout but suggesting a cleaner typescript type; GPT-4o proposing an optimized Express route config, etc.).
-Return ONLY valid JSON. No markdown backticks except standard JSON.`;
+Ensure the agents interact with each other. Return ONLY valid JSON. No markdown backticks except standard JSON.`;
 
       const response = await ai.models.generateContent({
         model: "gemini-3.5-flash",
@@ -810,8 +791,6 @@ Return ONLY valid JSON. No markdown backticks except standard JSON.`;
       try {
         parsedData = JSON.parse(responseText);
       } catch (e) {
-        console.warn("Failed to parse JSON response directly. Cleaning string...", responseText);
-        // Clean markdown code blocks if any got leaked
         const cleanJson = responseText.replace(/```json|```/g, "").trim();
         parsedData = JSON.parse(cleanJson);
       }
@@ -823,8 +802,7 @@ Return ONLY valid JSON. No markdown backticks except standard JSON.`;
     }
   });
 
-  // --- Serve Frontend ---
-
+  // --- Serve Frontend Static Build vs Development Proxy ---
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -844,6 +822,7 @@ Return ONLY valid JSON. No markdown backticks except standard JSON.`;
   });
 }
 
+// --- Execution Entrypoint ---
 if (process.argv.includes("--mcp") || process.argv.includes("mcp")) {
   startStdioMcp();
 } else {
